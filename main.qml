@@ -107,6 +107,12 @@ ApplicationWindow {
             url = initialUrl
         }
 
+        onNewWindowRequested: function(request) {
+            // Ignore the in-app navigation and hand off to the default browser
+            request.action = WebEngineNewWindowRequest.IgnoreRequest
+            windowHandler.open_url(request.requestedUrl.toString())
+        }
+
         settings.pluginsEnabled: false
     }
 }

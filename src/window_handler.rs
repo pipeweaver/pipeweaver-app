@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use qmetaobject::prelude::*;
 use std::sync::mpsc;
 
@@ -27,6 +27,15 @@ pub struct WindowHandler {
     on_close: qt_method!(
         fn on_close(&self) {
             self.close();
+        }
+    ),
+
+    // Allow QT to open a browser if a _blank link is clicked
+    open_url: qt_method!(
+        fn open_url(&self, url: String) {
+            if let Err(e) = open::that_detached(url) {
+                warn!("Failed to open URL in browser: {e}");
+            }
         }
     ),
 
@@ -62,6 +71,8 @@ impl WindowHandler {
 
             close: Default::default(),
             on_close: Default::default(),
+
+            open_url: Default::default(),
 
             check_notifications: Default::default(),
         }
