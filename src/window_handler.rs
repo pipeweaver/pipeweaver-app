@@ -1,9 +1,12 @@
+use log::debug;
 use qmetaobject::prelude::*;
 use std::sync::mpsc;
 
 pub enum WindowMessage {
     Trigger,
     Close,
+    /// Health check — Qt should send back () on the provided sender immediately.
+    Ping(mpsc::SyncSender<()>),
 }
 
 #[derive(QObject)]
@@ -36,8 +39,11 @@ pub struct WindowHandler {
                         self.on_trigger();
                     }
                     WindowMessage::Close => {
-                        // Handle close request from IPC
                         self.on_close();
+                    }
+                    WindowMessage::Ping(tx) => {
+                        debug!("Qt is alive! Responding to PING");
+                        let _ = tx.send(());
                     }
                 }
             }

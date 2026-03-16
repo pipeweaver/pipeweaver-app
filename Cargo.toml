@@ -26,6 +26,7 @@ dirs = "6.0.0"
 
 tungstenite = "0.28.0"
 cpp = "0.5.10"
+libc = "0.2.177"
 
 [build-dependencies]
 semver = "1"

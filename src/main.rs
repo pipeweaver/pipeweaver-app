@@ -7,6 +7,7 @@ use qmetaobject::prelude::*;
 use qmetaobject::webengine;
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,6 +24,12 @@ use crate::window_handler::{WindowHandler, WindowMessage};
 use window_properties::WindowProperties;
 
 const APP_NAME: &str = "pipeweaver-app";
+
+/// How long the IPC thread waits for Qt to pong back before declaring it hung.
+const QT_PING_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How long handle_active_instance waits for any reply from the existing instance.
+const IPC_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 cpp! {{
     #include <QGuiApplication>
@@ -71,6 +78,9 @@ fn real_main() -> Result<()> {
         println!("Instance Already active, Exiting");
         return Ok(());
     }
+
+    // Write our PID so a future instance can kill us if we become broken.
+    write_pid_file();
 
     // Channel for notifications from code to the Window
     let (notify_tx, notify_rx) = mpsc::channel();
@@ -125,11 +135,14 @@ fn real_main() -> Result<()> {
     engine.load_file("qrc:/webengine/main.qml".into());
     engine.exec();
 
+    // Clean up runtime files on a clean Qt exit.
+    let _ = fs::remove_file(get_socket_file_path());
+    let _ = fs::remove_file(get_pid_file_path());
+
     Ok(())
 }
 
 fn websocket_main_thread(res: mpsc::Sender<Result<()>>, tx: mpsc::Sender<WindowMessage>) {
-    // We need to spawn up a Websocket connection, then simply read from it until closed
     let uri = match Uri::builder()
         .authority("localhost:14565")
         .scheme("ws")
@@ -157,19 +170,16 @@ fn websocket_main_thread(res: mpsc::Sender<Result<()>>, tx: mpsc::Sender<WindowM
 
     loop {
         match socket.read() {
-            Ok(msg) => {
-                // NOOP everything except Ping/Pong
-                match msg {
-                    Message::Ping(payload) => {
-                        let _ = socket.send(Message::Pong(payload));
-                    }
-                    Message::Close(_) => {
-                        println!("Server closed the connection");
-                        break;
-                    }
-                    _ => {}
+            Ok(msg) => match msg {
+                Message::Ping(payload) => {
+                    let _ = socket.send(Message::Pong(payload));
                 }
-            }
+                Message::Close(_) => {
+                    println!("Server closed the connection");
+                    break;
+                }
+                _ => {}
+            },
             Err(tungstenite::Error::ConnectionClosed) => {
                 error!("Disconnected: connection closed");
                 break;
@@ -180,7 +190,6 @@ fn websocket_main_thread(res: mpsc::Sender<Result<()>>, tx: mpsc::Sender<WindowM
             }
             Err(e) => {
                 error!("Disconnected: other error: {e}");
-
                 break;
             }
         }
@@ -223,8 +232,33 @@ fn ipc_thread_main(tx: mpsc::Sender<WindowMessage>) -> Result<()> {
                 let mut msg = String::new();
                 if let Err(e) = stream.read_to_string(&mut msg) {
                     warn!("Failed to read message from stream: {e}");
-                } else if msg == "TRIGGER" {
-                    let _ = tx.send(WindowMessage::Trigger);
+                    continue;
+                }
+
+                if msg == "TRIGGER" {
+                    // Send a PING message to the Qt thread, this will return the next time
+                    // Qt polls from the qml into the rust code. If the channel is dead, or  we
+                    // exceed the timeout, assume the Qt side is dead.
+
+                    let (ping_tx, ping_rx) = mpsc::sync_channel(1);
+                    if tx.send(WindowMessage::Ping(ping_tx)).is_err() {
+                        // Channel is broken — Qt side is gone.
+                        warn!("Qt channel is broken, reporting instance as dead");
+                        let _ = stream.write_all(b"DEAD");
+                        continue;
+                    }
+
+                    match ping_rx.recv_timeout(QT_PING_TIMEOUT) {
+                        Ok(()) => {
+                            // Qt is alive — now forward the actual trigger.
+                            let _ = tx.send(WindowMessage::Trigger);
+                            let _ = stream.write_all(b"OK");
+                        }
+                        Err(_) => {
+                            warn!("Qt failed to respond to ping, reporting instance as dead");
+                            let _ = stream.write_all(b"DEAD");
+                        }
+                    }
                 }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -241,43 +275,103 @@ fn ipc_thread_main(tx: mpsc::Sender<WindowMessage>) -> Result<()> {
     Ok(())
 }
 
+/// Returns true if a healthy existing instance handled the launch (we should exit).
+/// Returns false if something is wrong, at which point we kill the existing process.
 pub fn handle_active_instance() -> bool {
     let socket_path = get_socket_file_path();
     debug!("Looking for Socket at {socket_path:?}");
 
     if !socket_path.exists() {
         debug!("Existing socket is not present");
-        // The socket file doesn't exist, so the socket can't exist.
         return false;
     }
 
     debug!("Attempting to Connect to Existing Socket");
-    // The socket exists, let's see if we can connect to it
-    match UnixStream::connect(&socket_path) {
-        Ok(mut stream) => {
-            debug!("Connected to Existing Socket at {socket_path:?}, Sending Trigger");
-            let _ = stream.write_all(b"TRIGGER");
-            return true;
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Failed to Connect to Socket: {e}, removing stale socket file");
+            let _ = fs::remove_file(&socket_path);
+            return false;
+        }
+    };
+
+    // Set a read timeout, if we don't get a response in this time, assume dead
+    let _ = stream.set_read_timeout(Some(IPC_REPLY_TIMEOUT));
+
+    // Attempt to write a trigger message..
+    if let Err(e) = stream.write_all(b"TRIGGER") {
+        debug!("Failed to write TRIGGER: {e}");
+        kill_existing_instance();
+        return false;
+    }
+    let _ = stream.shutdown(Shutdown::Write);
+
+    // Check the reply, if we're OK everything is good, otherwise it ded.
+    let mut reply = [0u8; 4];
+    let response_size = stream.read(&mut reply).unwrap_or(0);
+
+    if &reply[..response_size] == b"OK" {
+        debug!("Existing instance is healthy");
+        return true;
+    }
+
+    // "DEAD", timeout or zero response size, or anything unexpected — kill and take over.
+    if response_size == 0 {
+        debug!("No reply from existing instance (hung), killing it");
+    } else {
+        debug!("Existing instance reported itself as dead, killing it");
+    }
+    kill_existing_instance();
+    false
+}
+
+fn kill_existing_instance() {
+    let pid_path = get_pid_file_path();
+    match fs::read_to_string(&pid_path) {
+        Ok(contents) => {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                debug!("Sending SIGTERM to stale instance with PID {pid}");
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                // Give it a moment to clean up, then force if still alive.
+                thread::sleep(Duration::from_millis(500));
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = fs::remove_file(&pid_path);
         }
         Err(e) => {
-            debug!("Failed to Connect to Socket: {e}");
-            debug!("Removing Stale Socket File");
-            let _ = fs::remove_file(socket_path);
+            warn!("Could not read PID file to kill stale instance: {e}");
         }
     }
-    false
+    let _ = fs::remove_file(get_socket_file_path());
+}
+
+fn write_pid_file() {
+    let pid = std::process::id();
+    let path = get_pid_file_path();
+    if let Err(e) = fs::write(&path, pid.to_string()) {
+        warn!("Failed to write PID file at {path:?}: {e}");
+    }
 }
 
 fn get_socket_file_path() -> PathBuf {
     let mut path = runtime_dir().unwrap_or_else(env::temp_dir);
     path.push(format!("{}.sock", APP_NAME));
+    path
+}
 
+fn get_pid_file_path() -> PathBuf {
+    let mut path = runtime_dir().unwrap_or_else(env::temp_dir);
+    path.push(format!("{}.pid", APP_NAME));
     path
 }
 
 pub fn display_error(message: String) {
     use std::process::Command;
-    // We have two choices here, kdialog, or zenity. We'll try both.
     if let Err(e) = Command::new("kdialog")
         .arg("--title")
         .arg("Pipeweaver UI")

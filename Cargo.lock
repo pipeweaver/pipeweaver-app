@@ -391,6 +391,7 @@ dependencies = [
  "cpp_build",
  "dirs",
  "env_logger",
+ "libc",
  "log",
  "pkg-config",
  "qmetaobject",
