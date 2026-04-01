@@ -1,3 +1,7 @@
+# This repository has been deprecated and archived. The pipeweaver app is now managed in the [main Pipeweaver repository](https://github.com/pipeweaver/pipeweaver).
+
+---
+
 # Pipeweaver Wrapper App
 
 This is a simple app designed to be used with [Pipeweaver](https://github.com/pipeweaver/pipeweaver). It serves to
